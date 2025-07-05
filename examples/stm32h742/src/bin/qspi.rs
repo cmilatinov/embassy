@@ -4,10 +4,9 @@
 
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_stm32::mode::Async;
+use embassy_stm32::mode::Blocking;
 use embassy_stm32::qspi::enums::{AddressSize, ChipSelectHighTime, FIFOThresholdLevel, MemorySize, *};
 use embassy_stm32::qspi::{Config as QspiCfg, Instance, Qspi, TransferConfig};
-use embassy_stm32::time::mhz;
 use embassy_stm32::Config as StmCfg;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -39,17 +38,17 @@ const CMD_READ_CR: u8 = 0x35;
 
 const CMD_WRITE_SR: u8 = 0x01;
 const CMD_WRITE_CR: u8 = 0x31;
-const MEMORY_ADDR: u32 = 0x00000000u32;
+const MEMORY_ADDR: u32 = 0x00000001u32;
 
 /// Implementation of access to flash chip.
 /// Chip commands are hardcoded as it depends on used chip.
 /// This implementation is using chip GD25Q64C from Giga Device
 pub struct FlashMemory<I: Instance> {
-    qspi: Qspi<'static, I, Async>,
+    qspi: Qspi<'static, I, Blocking>,
 }
 
 impl<I: Instance> FlashMemory<I> {
-    pub fn new(qspi: Qspi<'static, I, Async>) -> Self {
+    pub fn new(qspi: Qspi<'static, I, Blocking>) -> Self {
         let mut memory = Self { qspi };
 
         memory.reset_memory();
@@ -113,7 +112,7 @@ impl<I: Instance> FlashMemory<I> {
         buffer
     }
 
-    pub fn read_memory(&mut self, addr: u32, buffer: &mut [u8], use_dma: bool) {
+    pub fn read_memory(&mut self, addr: u32, buffer: &mut [u8]) {
         let transaction = TransferConfig {
             iwidth: QspiWidth::SING,
             awidth: QspiWidth::SING,
@@ -122,11 +121,7 @@ impl<I: Instance> FlashMemory<I> {
             address: Some(addr),
             dummy: DummyCycles::_8,
         };
-        if use_dma {
-            self.qspi.blocking_read_dma(buffer, transaction);
-        } else {
-            self.qspi.blocking_read(buffer, transaction);
-        }
+        self.qspi.blocking_read(buffer, transaction);
     }
 
     fn wait_write_finish(&mut self) {
@@ -163,7 +158,7 @@ impl<I: Instance> FlashMemory<I> {
         self.exec_command(CMD_CHIP_ERASE);
     }
 
-    fn write_page(&mut self, addr: u32, buffer: &[u8], len: usize, use_dma: bool) {
+    fn write_page(&mut self, addr: u32, buffer: &[u8], len: usize) {
         assert!(
             (len as u32 + (addr & 0x000000ff)) <= MEMORY_PAGE_SIZE as u32,
             "write_page(): page write length exceeds page boundary (len = {}, addr = {:X}",
@@ -180,15 +175,11 @@ impl<I: Instance> FlashMemory<I> {
             dummy: DummyCycles::_0,
         };
         self.enable_write();
-        if use_dma {
-            self.qspi.blocking_write_dma(buffer, transaction);
-        } else {
-            self.qspi.blocking_write(buffer, transaction);
-        }
+        self.qspi.blocking_write(buffer, transaction);
         self.wait_write_finish();
     }
 
-    pub fn write_memory(&mut self, addr: u32, buffer: &[u8], use_dma: bool) {
+    pub fn write_memory(&mut self, addr: u32, buffer: &[u8]) {
         let mut left = buffer.len();
         let mut place = addr;
         let mut chunk_start = 0;
@@ -197,7 +188,7 @@ impl<I: Instance> FlashMemory<I> {
             let max_chunk_size = MEMORY_PAGE_SIZE - (place & 0x000000ff) as usize;
             let chunk_size = if left >= max_chunk_size { max_chunk_size } else { left };
             let chunk = &buffer[chunk_start..(chunk_start + chunk_size)];
-            self.write_page(place, chunk, chunk_size, use_dma);
+            self.write_page(place, chunk, chunk_size);
             place += chunk_size as u32;
             left -= chunk_size;
             chunk_start += chunk_size;
@@ -253,22 +244,24 @@ async fn main(_spawner: Spawner) -> ! {
     let mut config = StmCfg::default();
     {
         use embassy_stm32::rcc::*;
-        config.rcc.hse = Some(Hse {
-            freq: mhz(8),
-            mode: HseMode::Oscillator,
-        });
-        config.rcc.pll_src = PllSource::HSE;
-        config.rcc.pll = Some(Pll {
+        config.rcc.hsi = Some(HSIPrescaler::DIV1);
+        config.rcc.csi = true;
+        config.rcc.hsi48 = Some(Default::default()); // needed for RNG
+        config.rcc.pll1 = Some(Pll {
+            source: PllSource::HSI,
             prediv: PllPreDiv::DIV4,
-            mul: PllMul::MUL216,
-            divp: Some(PllPDiv::DIV2), // 8mhz / 4 * 216 / 2 = 216Mhz
+            mul: PllMul::MUL50,
+            divp: Some(PllDiv::DIV2),
             divq: None,
             divr: None,
         });
-        config.rcc.ahb_pre = AHBPrescaler::DIV1;
-        config.rcc.apb1_pre = APBPrescaler::DIV4;
-        config.rcc.apb2_pre = APBPrescaler::DIV2;
-        config.rcc.sys = Sysclk::PLL1_P;
+        config.rcc.sys = Sysclk::PLL1_P; // 400 Mhz
+        config.rcc.ahb_pre = AHBPrescaler::DIV2; // 200 Mhz
+        config.rcc.apb1_pre = APBPrescaler::DIV2; // 100 Mhz
+        config.rcc.apb2_pre = APBPrescaler::DIV2; // 100 Mhz
+        config.rcc.apb3_pre = APBPrescaler::DIV2; // 100 Mhz
+        config.rcc.apb4_pre = APBPrescaler::DIV2; // 100 Mhz
+        config.rcc.voltage_scale = VoltageScale::Scale1;
     }
     let p = embassy_stm32::init(config);
     info!("Embassy initialized");
@@ -281,9 +274,7 @@ async fn main(_spawner: Spawner) -> ! {
         fifo_threshold: FIFOThresholdLevel::_16Bytes,
         sample_shifting: SampleShifting::None,
     };
-    let driver = Qspi::new_bank1(
-        p.QUADSPI, p.PF8, p.PF9, p.PE2, p.PF6, p.PF10, p.PB10, p.DMA2_CH7, config,
-    );
+    let driver = Qspi::new_blocking_bank1(p.QUADSPI, p.PD11, p.PD12, p.PE2, p.PD13, p.PB2, p.PB10, config);
     let mut flash = FlashMemory::new(driver);
     let flash_id = flash.read_id();
     info!("FLASH ID: {:?}", flash_id);
@@ -293,8 +284,8 @@ async fn main(_spawner: Spawner) -> ! {
     }
     let mut rd_buf = [0u8; 256];
     flash.erase_sector(MEMORY_ADDR);
-    flash.write_memory(MEMORY_ADDR, &wr_buf, true);
-    flash.read_memory(MEMORY_ADDR, &mut rd_buf, true);
+    flash.write_memory(MEMORY_ADDR, &wr_buf);
+    flash.read_memory(MEMORY_ADDR, &mut rd_buf);
     info!("WRITE BUF: {:?}", wr_buf);
     info!("READ BUF: {:?}", rd_buf);
     info!("End of Program, proceed to empty endless loop");
