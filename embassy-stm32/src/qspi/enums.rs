@@ -336,14 +336,14 @@ impl Into<u8> for DummyCycles {
 #[derive(Copy, Clone)]
 pub enum SampleShifting {
     None,
-    HalfCycle
+    HalfCycle,
 }
 
 impl From<SampleShifting> for bool {
     fn from(value: SampleShifting) -> Self {
         match value {
             SampleShifting::None => false,
-            SampleShifting::HalfCycle => true
+            SampleShifting::HalfCycle => true,
         }
     }
 }
